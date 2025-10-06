@@ -12,13 +12,11 @@ globals [
 patches-own [
   is-restaurant?      ;; true if this patch hosts a restaurant
   rest-id             ;; restaurant identifier
-  price-level         ;; "cheap" | "affordable" | "expensive"
+  price               ;; "cheap" | "affordable" | "expensive"
   quality             ;; current quality (0–1)
   base-quality        ;; reference quality
   base-color          ;; base hue for visualization
   money               ;; available funds for advertisement etc.
-  capacity            ;; how many customers can sit
-  load                ;; how many are currently there
   open?               ;; open or closed
   cuisine             ;; optional, e.g. "thai", "mexican", etc.
 ]
@@ -82,6 +80,7 @@ to setup
     set preference-quality random-float 1
     set preference-price random-float 1
     set preference-distance random-float 1
+    set just-left? 0
   ]
   
   reset-ticks
@@ -151,9 +150,8 @@ to init-restaurant-attributes [id]
   ;; apply uniform attributes to all patches belonging to the same restaurant
   ask patches with [rest-id = id] [
     set quality 0.7 + random-float 0.3            ;; between 0.7–1.0
-    set price-level one-of ["cheap" "affordable" "expensive"]
+    set price one-of ["cheap" "affordable" "expensive"]
     set money random 1000
-    set capacity 10                              ;; e.g. same for all restaurants
   ]
 end
 
@@ -178,7 +176,7 @@ ask customers [
 
       ;; pulsating fade effect between white ↔ gray
       ;; sin() creates smooth brightness oscillation
-      let pulse (sin (ticks * 30))       ;; oscillates quickly
+      let pulse (sin (ticks * 40))       ;; oscillates quickly
       let fade (abs pulse * (just-left? / 5))  ;; intensity fades with time
       set color scale-color gray (1 + fade) 0 2
     ]
@@ -208,7 +206,6 @@ to maybe-enter-restaurant
     set hunger-level 0  ;; reset hunger
     ;; restaurant reacts
     ask patches with [rest-id = rest] [
-      set load load + 1
       ;; increase restaurant's money when a customer enters
       let income 50 + random 10     ;; each visit earns 10–20 units
       set money money + income
@@ -224,10 +221,6 @@ to stay-in-restaurant
     set state "wandering"
     set color white                ;; bright when just leaving
     set target-rest-id -1
-    ;; decrease restaurant load
-    ask patches with [is-restaurant? and rest-id = my-rest] [
-      set load max list 0 (load - 1)
-    ]
     
     ;; Step outward until outside restaurant
     rt random 360
@@ -281,7 +274,7 @@ end
     </chooser>
     <button x="195" y="112" height="60" disableUntilTicks="true" forever="false" kind="Observer" width="105" display="go-once">go</button>
     <button x="75" y="112" height="60" disableUntilTicks="true" forever="true" kind="Observer" width="105" display="go">go</button>
-    <slider x="75" step="1" y="187" max="100" width="225" display="num-customers" height="50" min="15" direction="Horizontal" default="15.0" variable="num-customers"></slider>
+    <slider x="75" step="1" y="187" max="100" width="225" display="num-customers" height="50" min="15" direction="Horizontal" default="100.0" variable="num-customers"></slider>
     <slider x="75" step="1" y="253" max="10" width="225" display="num-influencers" height="50" min="1" direction="Horizontal" default="10.0" variable="num-influencers"></slider>
   </widgets>
   <info>## WHAT IS IT?
