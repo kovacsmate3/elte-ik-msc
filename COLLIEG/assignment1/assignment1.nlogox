@@ -35,6 +35,7 @@ customers-own [
   preference-quality   ;; how much they care about quality (0–1)
   preference-price     ;; how much they care about price (0–1)
   preference-distance  ;; how much they care about proximity (0–1)
+  just-left?
 ]
 
 to setup
@@ -171,21 +172,28 @@ end
 
 to customer-step
 ask customers [
+    ;; cooldown visual effect
+    if just-left? > 0 [
+      set just-left? just-left? - 1
+
+      ;; pulsating fade effect between white ↔ gray
+      ;; sin() creates smooth brightness oscillation
+      let pulse (sin (ticks * 30))       ;; oscillates quickly
+      let fade (abs pulse * (just-left? / 5))  ;; intensity fades with time
+      set color scale-color gray (1 + fade) 0 2
+    ]
+    
     ;; hunger naturally increases each tick
     set hunger-level hunger-level + 0.01
     if hunger-level > 1 [ set hunger-level 1 ]
 
     if state = "wandering" [
-      ;; occasionally decide to enter a restaurant
-      if hunger-level > 0.8 [
+      if hunger-level > 0.8 and just-left? = 0 [
         maybe-enter-restaurant
       ]
-      if state = "wandering" [ move-agent ]  ;; still wandering if not entered
+      if state = "wandering" [ move-agent ]
     ]
-    
-    if state = "inside" [
-      stay-in-restaurant
-    ]
+    if state = "inside" [ stay-in-restaurant ]
   ]
 end
 
@@ -195,7 +203,7 @@ to maybe-enter-restaurant
     let rest [rest-id] of patch-here
     set state "inside"
     set target-rest-id rest
-    set stay-ticks 5 + random 10
+    set stay-ticks 20 + random 30
     set color [base-color] of patch-here
     set hunger-level 0  ;; reset hunger
     ;; restaurant reacts
@@ -214,17 +222,23 @@ to stay-in-restaurant
   if stay-ticks <= 0 [
     ;; leave the restaurant
     set state "wandering"
-    set color gray
+    set color white                ;; bright when just leaving
     set target-rest-id -1
     ;; decrease restaurant load
     ask patches with [is-restaurant? and rest-id = my-rest] [
       set load max list 0 (load - 1)
     ]
     
-    set target-rest-id -1
-    ;; step out slightly to avoid re-entering immediately
+    ;; Step outward until outside restaurant
     rt random 360
-    fd 1
+    let attempt 0
+    while [[is-restaurant?] of patch-here and attempt < 10] [
+      fd 1
+      set attempt attempt + 1
+    ]
+
+    ;; Add short cooldown
+    set just-left? 20
   ]
 end
 
