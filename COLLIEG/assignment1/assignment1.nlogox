@@ -7,6 +7,8 @@ globals [
   window-size
   patch-scale
   allowed-colors
+  rest-colors
+  cuisines-list
 ]
 
 patches-own [
@@ -108,7 +110,8 @@ to setup-restaurants
   ask patches [ set is-restaurant? false set pcolor black ]
   
   let centers restaurant-center-coords
-  let rest-colors [red orange yellow green blue violet]
+  set rest-colors [red orange pink green blue violet]
+  set cuisines-list ["thai" "mexican" "italian" "japanese" "indian" "greek"]
   
   ;; radius in patches for each restaurant area (controls how many patches per restaurant)
   let rest-radius max list 1 round (grid-size ^ 0.8 / 10)
@@ -116,6 +119,17 @@ to setup-restaurants
   (foreach centers rest-colors n-values 6 [i -> i] [
     [coord rest-color id] ->
       mark-restaurant-area coord rest-radius rest-color id
+    
+      ;; place label at adjusted center patch (slightly right for large grids)
+      let cx item 0 coord
+      let cy item 1 coord
+      
+      ;; adjust horizontal offset depending on grid size
+      let offset-x round (grid-size / 75)  ;; e.g. 0 at 20×20, 1 at 80×80, 2 at 160×160
+      ask patch (cx + offset-x) cy [
+        set plabel item id cuisines-list
+        set plabel-color white
+      ]
   ])
 end
 
@@ -147,13 +161,16 @@ to mark-restaurant-area [coord rest-radius rest-color id]
 end
 
 to init-restaurant-attributes [id]
+  let c item id cuisines-list
   ;; apply uniform attributes to all patches belonging to the same restaurant
   ask patches with [rest-id = id] [
     set quality 0.7 + random-float 0.3            ;; between 0.7–1.0
     set price one-of ["cheap" "affordable" "expensive"]
     set money random 1000
+    set cuisine c
   ]
 end
+
 
 to go
   influencer-step
