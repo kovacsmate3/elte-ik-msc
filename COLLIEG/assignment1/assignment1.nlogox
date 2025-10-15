@@ -8,7 +8,9 @@ globals [
   patch-scale
   allowed-colors
   rest-colors
+  restaurant-centers  ;; list of [rest-id center-patch]
   cuisines-list
+  restaurant-starting-money
 ]
 
 patches-own [
@@ -16,7 +18,6 @@ patches-own [
   rest-id             ;; restaurant identifier
   price               ;; "cheap" | "affordable" | "expensive"
   quality             ;; current quality (0–1)
-  base-quality        ;; reference quality
   base-color          ;; base hue for visualization
   money               ;; available funds for advertisement etc.
   open?               ;; open or closed
@@ -24,19 +25,28 @@ patches-own [
 ]
 
 influencers-own [
-  
+  influ-color
+  last-rest-id
+  last-rest-color
+  ticks-left          ;; number of ticks left to keep promoting
 ]
 
 customers-own [
-  state                ;; "wandering" | "inside"
+  state                ;; "wandering" | "inside" | "hungry" | "targeting"
   target-rest-id       ;; which restaurant they plan to visit
   stay-ticks           ;; how many ticks to remain inside
   hunger-level         ;; increases over time; above threshold -> seek restaurant
   preference-quality   ;; how much they care about quality (0–1)
   preference-price     ;; how much they care about price (0–1)
   preference-distance  ;; how much they care about proximity (0–1)
+  favorite-cuisine
   just-left?
+  inside-rest-id  
 ]
+
+;;;;;;;;;;;;;;;;;;;;;;;;
+;;; Setup procedures ;;;
+;;;;;;;;;;;;;;;;;;;;;;;;
 
 to setup
   clear-all
@@ -54,21 +64,45 @@ to setup
   
   ;; adjust agent size based on grid-size
   let size-scale 1
-  if grid-size <= 25 [ set size-scale 1.6 ]    ;; even smaller for very small grids
+  if grid-size <= 25 [ set size-scale 1.6 ]     ;; even smaller for very small grids
   if grid-size >= 100 [ set size-scale 0.8 ]    ;; slightly larger for big worlds
   
   set base-agent-size base-agent-size * size-scale
   
   set allowed-colors generate-allowed-colors
   
+  ;; === Precompute softmax-based starting money ===
+  let base-scores n-values 6 [ random-float softmax-variance ]
+  
+  ;; Softmax transformation
+  let exp-scores map [ val -> exp val ] base-scores
+  let sum-exp sum exp-scores
+  let softmax-weights map [ val -> val / sum-exp ] exp-scores
+  
+  ;; Allocate according to weights
+  set restaurant-starting-money map [ w -> w * total-budget ] softmax-weights
+  
+  if debug-mode [
+    print (word "Base scores: "       map [x -> precision x 2] base-scores)
+    print (word "Softmax weights: "   map [w -> precision w 3] softmax-weights)
+    print (word "Allocated funds: "   map [a -> precision a 1] restaurant-starting-money)
+    print (word "Sum of allocations: " precision (sum restaurant-starting-money) 2)
+  ]
+
   setup-restaurants
   
   create-influencers num-influencers [
     let c item (who mod length allowed-colors) allowed-colors
     set color c
+    set influ-color c
     set size base-agent-size
     set label (word "influ" (who + 1 ))
     set label-color white
+    
+    ;; new unified logical reference instead of coordinates
+    set last-rest-id -1
+    set last-rest-color black
+    set ticks-left 0
   ]
   
   create-customers num-customers [
@@ -82,7 +116,16 @@ to setup
     set preference-quality random-float 1
     set preference-price random-float 1
     set preference-distance random-float 1
+    set favorite-cuisine one-of cuisines-list
     set just-left? 0
+    set inside-rest-id -1
+    
+    if debug-mode [
+      print preference-quality
+      print preference-price
+      print preference-distance
+      print favorite-cuisine
+    ]
   ]
   
   reset-ticks
@@ -107,29 +150,41 @@ end
 
 to setup-restaurants
   ;; orchestrator – clear and create 6 restaurant zones
-  ask patches [ set is-restaurant? false set pcolor black ]
+  ask patches [ 
+    set is-restaurant? false 
+    set rest-id -1
+    set pcolor black 
+  ]
   
-  let centers restaurant-center-coords
+  let center-coords restaurant-center-coords
   set rest-colors [red orange pink green blue violet]
   set cuisines-list ["thai" "mexican" "italian" "japanese" "indian" "greek"]
+  
+  set restaurant-centers []
   
   ;; radius in patches for each restaurant area (controls how many patches per restaurant)
   let rest-radius max list 1 round (grid-size ^ 0.8 / 10)
   
-  (foreach centers rest-colors n-values 6 [i -> i] [
+  (foreach center-coords rest-colors n-values 6 [i -> i] [
     [coord rest-color id] ->
+      let cx item 0 coord
+      let cy item 1 coord
+      ;; store center patch reference
+      let center-patch patch cx cy
+    
+      if center-patch != nobody [
+        set restaurant-centers lput (list id center-patch) restaurant-centers
+      ]
+    
       mark-restaurant-area coord rest-radius rest-color id
     
       ;; place label at adjusted center patch (slightly right for large grids)
-      let cx item 0 coord
-      let cy item 1 coord
-      
       ;; adjust horizontal offset depending on grid size
       let offset-x round (grid-size / 75)  ;; e.g. 0 at 20×20, 1 at 80×80, 2 at 160×160
       ask patch (cx + offset-x) cy [
         set plabel item id cuisines-list
         set plabel-color white
-      ]
+      ]  
   ])
 end
 
@@ -156,8 +211,14 @@ to mark-restaurant-area [coord rest-radius rest-color id]
     set rest-id id
     set base-color rest-color
     set pcolor rest-color
+    set open? true 
   ]
   init-restaurant-attributes id
+end
+
+to-report restaurant-money [rid]
+  let center item 1 (item rid restaurant-centers)
+  report [money] of center
 end
 
 to init-restaurant-attributes [id]
@@ -166,106 +227,439 @@ to init-restaurant-attributes [id]
   ask patches with [rest-id = id] [
     set quality 0.7 + random-float 0.3            ;; between 0.7–1.0
     set price one-of ["cheap" "affordable" "expensive"]
-    set money random 1000
     set cuisine c
   ]
+  ;; only the center patch holds money
+  let center item 1 (item id restaurant-centers)
+  let starting-fund item id restaurant-starting-money
+  ask center [ set money floor starting-fund ]
 end
 
+;;;;;;;;;;;;;;;;;;;;;
+;;; Go procedures ;;;
+;;;;;;;;;;;;;;;;;;;;;
 
 to go
   influencer-step
   customer-step
+  restaurant-step
+  draw-influencer-halos
+  ;; --- stop condition: simulation ends when only one restaurant survives ---
+  if surviving-restaurants <= 1 [
+    ;;user-message (word "Simulation stopped: only " surviving-restaurants " restaurant remains.")
+    stop
+  ]
   tick
 end
 
 to influencer-step
   ask influencers [
-    move-agent
-    ; ... other logic
+    wandering   ;; just wander
+
+    ;; promotion timer management
+    if ticks-left > 0 [
+      set ticks-left ticks-left - 1
+    ]
+    if ticks-left = 0 and last-rest-id != -1 [
+      ;; reset only once, when the campaign just ended
+      set last-rest-id -1
+      set last-rest-color black
+      set color influ-color   ;; optionally reset color
+    ]
+    
+    ;; share continuously while a restaurant is remembered
+    if last-rest-id != -1 [
+      share-restaurant-tip
+    ]
+  ]
+end
+
+to restaurant-step
+  foreach restaurant-centers [
+    rpair ->
+      let rid item 0 rpair
+      let center-patch item 1 rpair
+      ask center-patch [ 
+      if debug-mode [
+        if ticks mod 100 = 0 [
+          show (word "Restaurant " rid 
+                     " money=" money
+                     " open=" open?
+                     " any influencer? " any? influencers with [last-rest-id = rid])
+        ]
+      ]
+      manage-restaurant 
+    ]
+  ]
+end
+
+to manage-restaurant
+  if not is-restaurant? [ stop ]
+  
+  ;; Basic economic flow
+  if (ticks mod 24 = 0) [
+    set money money - maintenance-cost   ;; e.g. daily expenses
+  ]
+  
+  ;; BANKRUPTCY CHECK
+  if money <= 0 [
+    close-restaurant rest-id
+    stop                                    ;; this center is no longer a restaurant
+  ]
+  
+  if debug-mode [
+    if ticks mod 100 = 0 [
+      show (word "[MANAGE] Rest " rest-id
+                " money=" precision money 2
+                " influencer-price=" influencer-price
+                " >? " (money > influencer-price))
+    ]
+  ]
+
+  
+  ;; hire an influencer
+  if money > 2 * influencer-price [
+    hire-influencer
+  ]
+end
+
+to close-restaurant [rid]
+  ;; kick out customers inside that restaurant (order no longer matters)
+  ask customers with [state = "inside" and inside-rest-id = rid] [
+    leave-restaurant "bankruptcy"
+  ]
+  
+  ;; free influencers promoting this restaurant
+  ask influencers with [last-rest-id = rid] [
+    set last-rest-id -1
+    set last-rest-color black
+    set ticks-left 0
+    set color influ-color
+  ]
+  
+  ;; mark all patches as closed + visually remove them
+  ask patches with [rest-id = rid] [
+    set open? false
+    set is-restaurant? false
+    set rest-id -1
+    set pcolor black
+    set plabel ""                    ;; clear label if any
+  ]
+end
+
+to hire-influencer
+  let free-influencers influencers with [last-rest-id = -1]
+  if any? free-influencers [
+    let chosen one-of free-influencers
+    ask chosen [
+      set last-rest-id [rest-id] of myself
+      set last-rest-color [base-color] of myself
+      set ticks-left influencer-duration  ;; promotion duration
+      set color [base-color] of myself
+    ]
+    set money money - influencer-price
+  ]
+end
+
+to share-restaurant-tip  ;; influencer context
+  let valid? any? patches with [is-restaurant? and open? and rest-id = [last-rest-id] of myself]
+  if not valid? [ stop ]
+  ask customers in-radius meet-radius
+    with [state = "wandering" and just-left? = 0 and hunger-level > 0.5] [
+
+    let shared-id [last-rest-id] of myself
+
+    ;; only share valid restaurant IDs
+    if shared-id != -1 [
+      set target-rest-id shared-id
+      set color [last-rest-color] of myself
+      set state "targeting"
+    ]
   ]
 end
 
 to customer-step
-ask customers [
+  ask customers [
     ;; cooldown visual effect
-    if just-left? > 0 [
-      set just-left? just-left? - 1
+    update-visuals
+    
+    update-hunger
 
-      ;; pulsating fade effect between white ↔ gray
-      ;; sin() creates smooth brightness oscillation
-      let pulse (sin (ticks * 40))       ;; oscillates quickly
-      let fade (abs pulse * (just-left? / 5))  ;; intensity fades with time
-      set color scale-color gray (1 + fade) 0 2
+    ;; --- Behavioural state transitions ---
+    if hunger-level > 0.85 and just-left? = 0 and state != "targeting" [
+      set state "hungry"
+    ]
+        
+    ;; --- Combined logic for inside state ---
+    if state = "inside" [
+      let rpatch patch-here
+      ;; if restaurant still valid → continue stay
+      ifelse [is-restaurant?] of rpatch and [open?] of rpatch [
+        stay-in-restaurant
+      ][
+        leave-restaurant "restaurant-closed"
+      ]
     ]
     
-    ;; hunger naturally increases each tick
-    set hunger-level hunger-level + 0.01
-    if hunger-level > 1 [ set hunger-level 1 ]
-
-    if state = "wandering" [
-      if hunger-level > 0.8 and just-left? = 0 [
-        maybe-enter-restaurant
-      ]
-      if state = "wandering" [ move-agent ]
-    ]
-    if state = "inside" [ stay-in-restaurant ]
+    ;; --- Other states --
+    if state = "hungry" [ choose-restaurant ]
+    if state = "wandering" [ wandering ]
+    if state = "targeting" [ targeting ]
   ]
 end
 
-to maybe-enter-restaurant
-  ;; if on a restaurant patch, enter it
-  if [is-restaurant?] of patch-here [
-    let rest [rest-id] of patch-here
+to update-visuals
+  if just-left? > 0 [
+    set just-left? just-left? - 1
+    
+    ;; pulsating fade effect between white ↔ gray
+    ;; sin() creates smooth brightness oscillation
+    let pulse (sin (ticks * 40))       ;; oscillates quickly
+    let fade (abs pulse * (just-left? / 5))  ;; intensity fades with time
+    set color scale-color gray (1 + fade) 0 2
+  ]
+end
+
+to update-hunger
+  ifelse just-left? = 0 [
+    set hunger-level hunger-level + hunger-rate
+  ][
+    set hunger-level hunger-level + (hunger-rate * 0.05)
+  ]
+  if hunger-level > 1 [ set hunger-level 1 ]
+end
+
+to targeting
+  ;; store once locally so we can use inside patch contexts
+  let rid target-rest-id
+  
+  ;; --- SAFETY CHECK ---
+  ;; if the target restaurant no longer exists (bankrupt or closed), abort immediately
+  if not valid-restaurant? rid [
+    handle-target-vanished rid "invalid-target"
+    stop
+  ]
+
+  ;; if the customer is physically on any patch belonging to the target restaurant
+  ifelse [is-restaurant?] of patch-here and [rest-id] of patch-here = rid [
+    
+    ;; === ARRIVAL ===
     set state "inside"
-    set target-rest-id rest
-    set stay-ticks 20 + random 30
+    set stay-ticks 50 + random 150
     set color [base-color] of patch-here
-    set hunger-level 0  ;; reset hunger
-    ;; restaurant reacts
-    ask patches with [rest-id = rest] [
-      ;; increase restaurant's money when a customer enters
-      let income 50 + random 10     ;; each visit earns 10–20 units
+    set hunger-level 0
+    set inside-rest-id rid 
+    ;; restaurant earns income once per entry
+    let center item 1 (item rid restaurant-centers)
+    ask center [
+      let income 50 + random 20
       set money money + income
     ]
+
+    ;; clear the pursuit target to avoid re-aiming loops
+    set target-rest-id -1
+
+  ] [
+    
+    ;; === MOVEMENT TOWARD TARGET RESTAURANT ===
+    let dest one-of patches with [is-restaurant? and open? and rest-id = rid]
+
+    if dest != nobody [
+      facexy [pxcor] of dest [pycor] of dest
+      
+      ;; --- Target-aware movement logic ---
+      let step-size calc-step-size
+      let next-patch patch-ahead step-size
+
+      ;; Only avoid other restaurants (not the target)
+      if next-patch != nobody [
+        if [is-restaurant?] of next-patch and [rest-id] of next-patch != rid [
+          rt 20 + random 40     ;; small steering instead of total flip
+        ]
+      ]
+
+      ;; prevent boundary collisions
+      if not can-move? step-size [ rt 180 ]
+      fd step-size
+    ]
+
+    ;; target vanished (closed)
+    if dest = nobody [
+      set state "wandering"
+      set target-rest-id -1
+    ]
   ]
+end
+
+to choose-restaurant
+  ;; pick best restaurant, but DO NOT move here
+  let best-rest nobody
+  let best-score -9999
+
+  let rest-centers patches with [is-restaurant? and open?]
+  let unique-rest-ids remove-duplicates [rest-id] of rest-centers
+  
+  if debug-mode [
+    print (word "=== Customer " who " is choosing among restaurants ===")
+  ]
+
+  
+  foreach unique-rest-ids [ r-id ->
+    let sample one-of patches with [rest-id = r-id and is-restaurant? and open?]
+    if sample != nobody [
+      let s restaurant-score sample self
+      if s > best-score [
+        set best-score s
+        set best-rest sample
+      ]
+    ]
+  ]
+
+  if best-rest != nobody [
+    set target-rest-id [rest-id] of best-rest
+    set state "targeting"     ;; ← key change: use the non-blocking mover
+    
+    if debug-mode [
+      print (word "→ Customer " who " CHOSE restaurant " [cuisine] of best-rest
+        " with score " precision best-score 3)
+    ]
+
+  ]
+end
+
+to-report restaurant-score [restaurant-patch customer-agent]
+  ;; Computes the attraction score of a restaurant for a specific customer.
+  
+  ;; --- Extract restaurant attributes ---
+  let rest-quality        [quality] of restaurant-patch
+  let rest-price-category [price] of restaurant-patch
+  let rest-cuisine-type   [cuisine] of restaurant-patch
+  let distance-to-rest    distance restaurant-patch
+
+  ;; --- Normalize and invert distance (closer = higher value) ---
+  let distance-score (1 / (1 + distance-to-rest))
+
+  ;; --- Convert price category into numeric value (higher = cheaper/better) ---
+  let price-score (
+    ifelse-value (rest-price-category = "cheap")       [0.9]
+    [ifelse-value (rest-price-category = "affordable") [0.6]
+    [0.3]]
+  )
+
+  ;; --- Cuisine preference match ---
+  let customer-favorite-cuisine [favorite-cuisine] of customer-agent
+  let cuisine-score (
+    ifelse-value (rest-cuisine-type = customer-favorite-cuisine) [1.0] [0.5]
+  )
+
+  ;; --- Retrieve customer's personal preferences (0–1) ---
+  let pref-quality  [preference-quality]  of customer-agent
+  let pref-price    [preference-price]    of customer-agent
+  let pref-distance [preference-distance] of customer-agent
+
+  ;; --- Combine everything with global slider weights ---
+  let total-score (
+    (pref-quality  * rest-quality       * quality-weight) +
+    (pref-price    * price-score        * price-weight)  +
+    (pref-distance * distance-score     * distance-weight) +
+    (cuisine-score * 0.5)   ;; extra minor cuisine bonus
+  )
+  
+  if debug-mode [
+      print (word
+      "[Customer " [who] of customer-agent
+      " (" [favorite-cuisine] of customer-agent
+      " pref: Q=" precision pref-quality 2
+      " P=" precision pref-price 2
+      " D=" precision pref-distance 2
+      ")] → Restaurant "
+      rest-cuisine-type
+      " [Q=" precision rest-quality 2
+      " P=" rest-price-category
+      " Dist=" precision distance-to-rest 2
+      "] => total-score=" precision total-score 3
+    )
+  ]
+
+
+  report total-score
 end
 
 to stay-in-restaurant
-  let my-rest target-rest-id
   set stay-ticks stay-ticks - 1
   if stay-ticks <= 0 [
-    ;; leave the restaurant
-    set state "wandering"
-    set color white                ;; bright when just leaving
-    set target-rest-id -1
-    
-    ;; Step outward until outside restaurant
-    rt random 360
-    let attempt 0
-    while [[is-restaurant?] of patch-here and attempt < 10] [
-      fd 1
-      set attempt attempt + 1
-    ]
+    leave-restaurant "finished-eating"
+  ]
+end
 
-    ;; Add short cooldown
-    set just-left? 20
+to leave-restaurant [reason]
+  ;; customer leaves a restaurant (either normally or due to closure)
+  set inside-rest-id -1
+  set state "wandering"
+  set color white
+  set target-rest-id -1
+
+  ;; small step outward to avoid remaining on restaurant patches
+  rt random 360
+  let attempt 0
+  while [[is-restaurant?] of patch-here and attempt < 10] [
+    fd 1.5 + random-float 0.5
+    rt random 30 - random 30
+    set attempt attempt + 1
+  ]
+
+  ;; compute cooldown based on satisfaction (if known)
+  let satisfaction 0.0
+  if [is-restaurant?] of patch-here [
+    set satisfaction [quality] of patch-here
+  ]
+
+  let base-cooldown 30
+  set just-left? round (base-cooldown + satisfaction * 80)
+
+  ;; reset hunger
+  set hunger-level 0
+
+  ;; optional debug
+  if debug-mode [
+    show (word "Customer " who " left restaurant due to " reason)
+  ]
+end
+
+to-report valid-restaurant? [rid]
+  report rid != -1 and any? patches with [is-restaurant? and open? and rest-id = rid]
+end
+
+to handle-target-vanished [rid reason]
+  ;; if the advertised / selected restaurant disappeared while en route
+  set target-rest-id -1
+  set inside-rest-id -1
+  ;; visual reset (no longer “branded” by the campaign)
+  set color gray
+
+  ;; if already hungry enough, immediately reconsider alternatives; else wander
+  ifelse hunger-level > 0.85 and just-left? = 0 [
+    set state "hungry"
+  ][
+    set state "wandering"
+  ]
+
+  if debug-mode [
+    show (word "Customer " who " retargeted due to " reason " (rid=" rid ")")
   ]
 end
 
 
-to move-agent
+to wandering
   rt random 40
   lt random 40
-   ;; Compute dynamic step size (smaller worlds → smaller step)
-    let step-size 0
   
-  ifelse grid-size <= 20 [
-    ;; small world → move slowly (prevent jumping across)
-    set step-size 0.06
-  ] [
-    ;; default smooth scaling for normal and large worlds
-    set step-size ((grid-size ^ 0.5) / 45)
-  ]
+  move
+  
+end
+
+to move
+  let step-size calc-step-size
   
   ;; Customers avoid restaurants unless entering
   if breed = customers [
@@ -281,18 +675,247 @@ to move-agent
   fd step-size
 end
 
-]]></code>
+to-report calc-step-size
+  ;; Compute dynamic step size (smaller worlds → smaller step)
+  report (ifelse-value (grid-size <= 20)
+    [0.06]
+    [((grid-size ^ 0.5) / 45)]
+  )
+end
+
+;; OBSERVER-ONLY stamper
+to stamp-circle-observer [cx cy rad col]
+  create-turtles 1 [
+    setxy cx cy
+    set shape "circle"
+    set size (rad * 2)   ;; diameter in patch units
+    set color col
+    set hidden? true
+    stamp
+    die
+  ]
+end
+
+to draw-influencer-halos
+  clear-drawing
+  if meet-radius <= 0 [ stop ]
+  foreach sort (influencers with [ last-rest-id != -1 ]) [
+    i ->
+      let base ([last-rest-color] of i)
+      let faded scale-color [last-rest-color] of i 2.5 1 3
+      stamp-circle-observer ([xcor] of i) ([ycor] of i) meet-radius faded
+  ]
+end
+
+to-report surviving-restaurants
+  let alive 0
+  foreach restaurant-centers [
+    pair ->
+      let center-patch item 1 pair
+      if [is-restaurant?] of center-patch and [open?] of center-patch [
+        set alive alive + 1
+      ]
+  ]
+  report alive
+end
+
+to-report gini-income
+  ;; collect money values only from restaurant centers
+  let incomes []
+  foreach restaurant-centers [
+    pair ->
+      let center-patch item 1 pair
+      if [open?] of center-patch [
+        set incomes lput [money] of center-patch incomes
+      ]
+  ]
+
+  if empty? incomes [ report 0 ]
+
+  ;; standard Gini computation
+  let sorted sort incomes
+  let n length sorted
+  let meanval mean sorted
+  if meanval = 0 [ report 0 ]
+
+  ;; sum over indices properly using map instead of undeclared 'i'
+  let cum-sum sum map [ idx -> (idx + 1) * item idx sorted ] (range n)
+  report (2 * cum-sum) / (n * sum sorted) - ((n + 1) / n)
+end
+
+to-report top-restaurant-share
+  ;; collect the current money values from restaurant centers only
+  let incomes []
+  foreach restaurant-centers [
+    pair ->
+      let center-patch item 1 pair
+      if [open?] of center-patch [
+        set incomes lput [money] of center-patch incomes
+      ]
+  ]
+  
+  if empty? incomes [ report 0 ]
+
+  let max-income max incomes
+  let total-income sum incomes
+  if total-income = 0 [ report 0 ]
+
+  ;; return fraction of total wealth held by the richest restaurant
+  report max-income / total-income
+end
+
+to-report top-restaurant-name
+  let richest nobody
+  let max-income -1
+  foreach restaurant-centers [
+    pair ->
+      let center item 1 pair
+      if [open?] of center [
+        let val [money] of center
+        if val > max-income [
+          set max-income val
+          set richest center
+        ]
+      ]
+  ]
+  if richest = nobody [ report "none" ]
+  report [cuisine] of richest
+end
+
+to-report active-influencers
+  report count influencers with [last-rest-id != -1]
+end
+
+
+
+
+
+; Copyright 2025 Máté Kovács.]]></code>
   <widgets>
-    <view x="368" wrappingAllowedX="false" y="10" frameRate="30.0" minPycor="-10" height="612" showTickCounter="true" patchSize="32.0" fontSize="10" wrappingAllowedY="false" width="612" tickCounterLabel="ticks" maxPycor="9" updateMode="1" maxPxcor="9" minPxcor="-10"></view>
-    <button x="220" y="40" height="60" disableUntilTicks="false" forever="false" kind="Observer" width="80" display="setup">setup</button>
-    <chooser x="75" y="40" height="60" variable="grid-size" current="0" width="130" display="grid-size">
+    <view x="363" wrappingAllowedX="false" y="10" frameRate="30.0" minPycor="-10" height="612" showTickCounter="true" patchSize="32.0" fontSize="10" wrappingAllowedY="false" width="612" tickCounterLabel="ticks" maxPycor="9" updateMode="1" maxPxcor="9" minPxcor="-10"></view>
+    <chooser x="75" y="3" height="60" variable="grid-size" current="0" width="130" display="grid-size">
       <choice type="double" value="20.0"></choice>
       <choice type="double" value="128.0"></choice>
     </chooser>
-    <button x="195" y="112" height="60" disableUntilTicks="true" forever="false" kind="Observer" width="105" display="go-once">go</button>
-    <button x="75" y="112" height="60" disableUntilTicks="true" forever="true" kind="Observer" width="105" display="go">go</button>
-    <slider x="75" step="1" y="187" max="100" width="225" display="num-customers" height="50" min="15" direction="Horizontal" default="100.0" variable="num-customers"></slider>
-    <slider x="75" step="1" y="253" max="10" width="225" display="num-influencers" height="50" min="1" direction="Horizontal" default="10.0" variable="num-influencers"></slider>
+    <button x="195" y="75" height="60" disableUntilTicks="true" forever="false" kind="Observer" width="105" display="go-once">go</button>
+    <button x="75" y="75" height="60" disableUntilTicks="true" forever="true" kind="Observer" width="105" display="go">go</button>
+    <slider x="25" step="1" y="150" max="500" width="150" display="num-customers" height="50" min="1" direction="Horizontal" default="77.0" variable="num-customers"></slider>
+    <slider x="185" step="1" y="150" max="100" width="150" display="num-influencers" height="50" min="0" direction="Horizontal" default="36.0" variable="num-influencers"></slider>
+    <slider x="25" step="0.1" y="329" max="6.5" width="150" display="meet-radius" height="50" min="0.5" direction="Horizontal" default="1.5" variable="meet-radius"></slider>
+    <slider x="185" step="0.00001" y="329" max="0.002" width="150" display="hunger-rate" height="50" min="0.00005" direction="Horizontal" default="0.002" variable="hunger-rate"></slider>
+    <slider x="25" step="10" y="389" max="2000" width="150" display="influencer-price" height="50" min="500" direction="Horizontal" default="520.0" variable="influencer-price"></slider>
+    <slider x="25" step="0.1" y="210" max="5" width="150" display="price-weight" height="50" min="0" direction="Horizontal" default="1.4" variable="price-weight"></slider>
+    <slider x="185" step="0.1" y="210" max="5" width="150" display="distance-weight" height="50" min="0" direction="Horizontal" default="4.0" variable="distance-weight"></slider>
+    <input x="25" multiline="false" y="450" height="60" variable="total-budget" type="number" width="150">10000.0</input>
+    <slider x="25" step="0.1" y="270" max="5" width="150" display="quality-weight" height="50" min="0" direction="Horizontal" default="1.7" variable="quality-weight"></slider>
+    <slider x="185" step="0.1" y="270" max="20" width="150" display="softmax-variance" height="50" min="0" direction="Horizontal" default="9.2" variable="softmax-variance"></slider>
+    <switch x="120" y="530" height="40" on="false" variable="debug-mode" width="105" display="debug-mode"></switch>
+    <plot x="985" autoPlotX="true" yMax="10.0" autoPlotY="true" yAxis="money (units)" y="359" xMin="0.0" height="250" legend="true" xMax="10.0" yMin="0.0" width="225" xAxis="ticks" display="Restaurant Income over Time">
+      <setup></setup>
+      <update></update>
+      <pen interval="1.0" mode="0" display="thai" color="-2674135" legend="true">
+        <setup></setup>
+        <update>plot mean [money] of patches with [cuisine = "thai"]</update>
+      </pen>
+      <pen interval="1.0" mode="0" display="mexican" color="-955883" legend="true">
+        <setup></setup>
+        <update>plot mean [money] of patches with [cuisine = "mexican"]</update>
+      </pen>
+      <pen interval="1.0" mode="0" display="italian" color="-2064490" legend="true">
+        <setup></setup>
+        <update>plot mean [money] of patches with [cuisine = "italian"]</update>
+      </pen>
+      <pen interval="1.0" mode="0" display="japanese" color="-10899396" legend="true">
+        <setup></setup>
+        <update>plot mean [money] of patches with [cuisine = "japanese"]</update>
+      </pen>
+      <pen interval="1.0" mode="0" display="indian" color="-13345367" legend="true">
+        <setup></setup>
+        <update>plot mean [money] of patches with [cuisine = "indian"]</update>
+      </pen>
+      <pen interval="1.0" mode="0" display="greek" color="-8630108" legend="true">
+        <setup></setup>
+        <update>plot mean [money] of patches with [cuisine = "greek"]</update>
+      </pen>
+    </plot>
+    <plot x="1325" autoPlotX="true" yMax="10.0" autoPlotY="true" yAxis="number of customers inside" y="361" xMin="0.0" height="250" legend="false" xMax="10.0" yMin="0.0" width="225" xAxis="ticks" display="Customer Distribution per Restaurant">
+      <setup></setup>
+      <update></update>
+      <pen interval="1.0" mode="0" display="thai" color="-2674135" legend="true">
+        <setup></setup>
+        <update>plot count customers with [state = "inside" and [cuisine] of patch-here = "thai"]</update>
+      </pen>
+      <pen interval="1.0" mode="0" display="mexican" color="-955883" legend="true">
+        <setup></setup>
+        <update>plot count customers with [state = "inside" and [cuisine] of patch-here = "mexican"]</update>
+      </pen>
+      <pen interval="1.0" mode="0" display="italian" color="-2064490" legend="true">
+        <setup></setup>
+        <update>plot count customers with [state = "inside" and [cuisine] of patch-here = "italian"]</update>
+      </pen>
+      <pen interval="1.0" mode="0" display="japanese" color="-10899396" legend="true">
+        <setup></setup>
+        <update>plot count customers with [state = "inside" and [cuisine] of patch-here = "japanese"]</update>
+      </pen>
+      <pen interval="1.0" mode="0" display="indian" color="-13345367" legend="true">
+        <setup></setup>
+        <update>plot count customers with [state = "inside" and [cuisine] of patch-here = "indian"]</update>
+      </pen>
+      <pen interval="1.0" mode="0" display="greek" color="-8630108" legend="true">
+        <setup></setup>
+        <update>plot count customers with [state = "inside" and [cuisine] of patch-here = "greek"]</update>
+      </pen>
+    </plot>
+    <button x="220" y="3" height="60" disableUntilTicks="false" forever="false" kind="Observer" width="80" display="setup">setup</button>
+    <monitor x="1217" precision="17" y="387" height="60" fontSize="11" width="100" display="Surviving Restaurants">surviving-restaurants</monitor>
+    <monitor x="1218" precision="17" y="459" height="60" fontSize="11" width="100" display="Free Influencers">count influencers with [last-rest-id = -1]</monitor>
+    <monitor x="1219" precision="17" y="531" height="60" fontSize="11" width="100" display="Income Inequality (Gini)">gini-income</monitor>
+    <monitor x="1355" precision="17" y="286" height="60" fontSize="11" width="165" display="Greek restaurant's money">restaurant-money 5</monitor>
+    <monitor x="1180" precision="17" y="286" height="60" fontSize="11" width="165" display="Indian restaurant's money">restaurant-money 4</monitor>
+    <monitor x="1005" precision="17" y="216" height="60" fontSize="11" width="165" display="Thai restaurant's money">restaurant-money 0</monitor>
+    <monitor x="1180" precision="17" y="216" height="60" fontSize="11" width="165" display="Mexican restaurant's money">restaurant-money 1</monitor>
+    <monitor x="1355" precision="17" y="216" height="60" fontSize="11" width="165" display="Italian restaurant's money">restaurant-money 2</monitor>
+    <monitor x="1005" precision="17" y="286" height="60" fontSize="11" width="165" display="Japanese restaurant's money">restaurant-money 3</monitor>
+    <slider x="185" step="100" y="389" max="3000" width="150" display="influencer-duration" height="50" min="200" direction="Horizontal" default="1400.0" variable="influencer-duration" units="tick"></slider>
+    <slider x="185" step="1" y="450" max="3000" width="150" display="maintenance-cost" height="60" min="20" direction="Horizontal" default="332.0" variable="maintenance-cost"></slider>
+    <plot x="1330" autoPlotX="true" yMax="10.0" autoPlotY="true" yAxis="Active influencers" y="25" xMin="0.0" height="175" legend="false" xMax="7.0" yMin="0.0" xAxis="ticks" display="Active Influencers Over Time" width="220" sizeVersion="0">
+      <setup></setup>
+      <update>plot active-influencers</update>
+      <pen interval="1.0" mode="0" display="pen-0" color="-16777216" legend="true">
+        <setup></setup>
+        <update></update>
+      </pen>
+    </plot>
+    <plot x="985" autoPlotX="true" yMax="10.0" autoPlotY="true" yAxis="Count" y="25" xMin="0.0" height="175" legend="true" xMax="7.0" yMin="0.0" xAxis="Cuisine" display="Customer Cuisine Preferences" width="225" sizeVersion="0">
+      <setup><![CDATA[clear-plot
+let cuisines cuisines-list
+let colors   [red orange pink green blue violet]
+
+;; axis ranges (static snapshot)
+let counts map [ cu -> count customers with [favorite-cuisine = cu] ] cuisines
+let ymax (max (sentence 1 counts))  ;; avoid 0 range
+set-plot-x-range 0 length cuisines
+set-plot-y-range 0 (ymax + 5)
+
+foreach (range length cuisines)
+[ idx ->
+  let c item idx cuisines
+  let h item idx counts
+
+  create-temporary-plot-pen c
+  set-plot-pen-mode 1            ;; bar mode
+  set-plot-pen-color item idx colors
+
+  plot-pen-up
+  plotxy (idx + 1) 0 
+  plot-pen-down 
+  plotxy (idx + 1) h 
+  plot-pen-up
+]]]></setup>
+      <update></update>
+    </plot>
+    <monitor x="1220" precision="17" y="45" height="60" fontSize="11" width="100" display="Top Restaurant Market Share">top-restaurant-share * 100</monitor>
+    <monitor x="1220" precision="17" y="120" height="60" fontSize="11" width="100" display="Top Restaurant">top-restaurant-name</monitor>
   </widgets>
   <info>## WHAT IS IT?
 
@@ -1223,4 +1846,59 @@ end
     </shape>
   </linkShapes>
   <previewCommands>setup repeat 75 [ go ]</previewCommands>
+  <experiments>
+    <experiment name="experiment1" repetitions="20" sequentialRunOrder="true" runMetricsEveryStep="true" timeLimit="10000">
+      <setup>setup</setup>
+      <go>go</go>
+      <metrics>
+        <metric>top-restaurant-share</metric>
+        <metric>gini-income</metric>
+        <metric>surviving-restaurants</metric>
+        <metric>active-influencers</metric>
+      </metrics>
+      <constants>
+        <enumeratedValueSet variable="num-customers">
+          <value value="1"></value>
+          <value value="10"></value>
+          <value value="20"></value>
+          <value value="30"></value>
+          <value value="40"></value>
+          <value value="50"></value>
+          <value value="60"></value>
+          <value value="70"></value>
+          <value value="80"></value>
+          <value value="90"></value>
+          <value value="100"></value>
+          <value value="110"></value>
+          <value value="120"></value>
+          <value value="130"></value>
+          <value value="140"></value>
+          <value value="150"></value>
+          <value value="160"></value>
+          <value value="170"></value>
+          <value value="180"></value>
+          <value value="190"></value>
+          <value value="200"></value>
+          <value value="210"></value>
+          <value value="220"></value>
+          <value value="230"></value>
+          <value value="240"></value>
+          <value value="250"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="softmax-variance">
+          <value value="0"></value>
+          <value value="2"></value>
+          <value value="4"></value>
+          <value value="6"></value>
+          <value value="8"></value>
+          <value value="10"></value>
+          <value value="12"></value>
+          <value value="14"></value>
+          <value value="16"></value>
+          <value value="18"></value>
+          <value value="20"></value>
+        </enumeratedValueSet>
+      </constants>
+    </experiment>
+  </experiments>
 </model>
